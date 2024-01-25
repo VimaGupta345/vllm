@@ -26,9 +26,10 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 import torch
+import csv
 import torch.nn.functional as F
 
-from torch import nn
+from torch import logit, nn
 from transformers import MixtralConfig
 
 from vllm.model_executor.input_metadata import InputMetadata
@@ -52,7 +53,7 @@ from vllm.model_executor.weight_utils import (default_weight_loader,
 from vllm.sequence import SamplerOutput
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
-
+LogitStore = List[torch.Tensor]
 
 class MixtralMLP(nn.Module):
 
@@ -91,6 +92,52 @@ class MixtralMLP(nn.Module):
         current_hidden_states = w1_out * w3_out
         current_hidden_states, _ = self.w2(current_hidden_states)
         return current_hidden_states
+    
+class MixtralLogitStore(nn.Module):
+    """This code dumps the router logits computed in forward pass of MixtralMoE for each token in the sequence."""
+    def __init__(self):
+        super().__init__()
+        self.router_logit_store = []
+        self.csv_path = "router_logits.csv"
+        self.dump_frequency = 1000
+        self.batch_idx = 0
+    def dump_router_logits(self, router_logits, layer_idx):
+        if router_logits.is_cuda:
+            router_logits = router_logits.cpu()
+        self.router_logit_store.append((self.batch_idx, layer_idx, router_logits))
+        
+    def end_batch(self):
+        self.batch_idx += 1
+        if self.batch_idx%5 == 0:
+            self.write_to_csv()
+            self.clear_router_logits()
+            
+    def get_stored_router_logits(self):
+        # router_logits: (batch * sequence_length, n_experts)
+        # returned value: number of tokens, batch_size*seq_len, n_experts
+        return torch.stack(self.router_logit_store)
+    def clear_router_logits(self):
+        self.router_logit_store = []
+    def write_to_csv(self):
+        with open(self.csv_path, 'a', newline='') as csvfile:
+            csvwriter = csv.writer(csvfile)
+            
+            # Check if the file is empty to decide whether to write the header
+            csvfile.seek(0)  # Go to the start of the file
+            if csvfile.tell() == 0:  # If file is empty, write the header
+                # Creating a header row
+                # Assuming a maximum number of logits, you can adjust this as needed
+                max_logits = 8  # Example, change this based on your maximum number of logits
+                header = ['Batch Index', 'Layer Index'] + [f'Logit_{i}' for i in range(max_logits)]
+                csvwriter.writerow(header)
+
+            # Writing the logit data
+            for batch_idx, layer_idx, logits_tensor in self.router_logit_store:
+                logits_list = logits_tensor.tolist()  # Convert tensor to a list
+                for logit in logits_list:
+                    row = [batch_idx, layer_idx] + logit  # Combine batch and layer index with logit values
+                    csvwriter.writerow(row)
+
 
 
 class MixtralMoE(nn.Module):
@@ -99,6 +146,8 @@ class MixtralMoE(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        logit_store: Optional[MixtralLogitStore] = None,
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
@@ -106,6 +155,8 @@ class MixtralMoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_total_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
+        self.logits_store = logit_store
+        self.layer_idx = layer_idx
         if self.tp_size > self.num_total_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -135,7 +186,10 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits, _ = self.gate(hidden_states)
-
+        # store the router logits for each token when the batch starts?
+        if self.logits_store is not None:
+            self.logits_store.dump_router_logits(router_logits, layer_idx = self.layer_idx)
+        
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights,
                                                        self.top_k,
@@ -158,7 +212,8 @@ class MixtralMoE(nn.Module):
 
         return tensor_model_parallel_all_reduce(final_hidden_states).view(
             batch_size, sequence_length, hidden_dim)
-
+    
+    
 
 class MixtralAttention(nn.Module):
 
@@ -244,9 +299,13 @@ class MixtralDecoderLayer(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        logit_store: Optional[MixtralLogitStore] = None,
+        layer_idx: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.logit_store = logit_store
+        self.layer_idx = layer_idx
         # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = MixtralAttention(
@@ -258,7 +317,7 @@ class MixtralDecoderLayer(nn.Module):
             sliding_window=config.sliding_window,
             linear_method=linear_method)
         self.block_sparse_moe = MixtralMoE(config=config,
-                                           linear_method=linear_method)
+                                           linear_method=linear_method, logit_store= self.logit_store, layer_idx=self.layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
@@ -299,17 +358,18 @@ class MixtralModel(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        logit_store: Optional[MixtralLogitStore] = None,
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
+        self.logit_store = logit_store
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
         )
         self.layers = nn.ModuleList([
-            MixtralDecoderLayer(config, linear_method=linear_method)
+            MixtralDecoderLayer(config, linear_method=linear_method, logit_store=self.logit_store, layer_idx=_)
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -342,9 +402,11 @@ class MixtralForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.model = MixtralModel(config, linear_method)
+        self.logit_store = MixtralLogitStore()  # Initialize the logit store
+        self.model = MixtralModel(config, linear_method, self.logit_store)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.sampler = Sampler(config.vocab_size)
+        
 
     def forward(
         self,
@@ -355,6 +417,7 @@ class MixtralForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    input_metadata)
+        self.logit_store.end_batch()
         return hidden_states
 
     def sample(
