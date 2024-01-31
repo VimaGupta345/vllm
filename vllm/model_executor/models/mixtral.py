@@ -93,51 +93,6 @@ class MixtralMLP(nn.Module):
         current_hidden_states = w1_out * w3_out
         current_hidden_states, _ = self.w2(current_hidden_states)
         return current_hidden_states
-    
-class MixtralLogitStore(nn.Module):
-    """This code dumps the router logits computed in forward pass of MixtralMoE for each token in the sequence."""
-    def __init__(self):
-        super().__init__()
-        self.router_logit_store = []
-        self.csv_path = "router_logits.csv"
-        self.dump_frequency = 1000
-        self.batch_idx = 0
-    def dump_router_logits(self, router_logits, layer_idx):
-        if router_logits.is_cuda:
-            router_logits = router_logits.cpu()
-        self.router_logit_store.append((self.batch_idx, layer_idx, router_logits))
-        
-    def end_batch(self):
-        self.batch_idx += 1
-        if self.batch_idx%5 == 0:
-            self.write_to_csv()
-            self.clear_router_logits()
-            
-    def get_stored_router_logits(self):
-        # router_logits: (batch * sequence_length, n_experts)
-        # returned value: number of tokens, batch_size*seq_len, n_experts
-        return torch.stack(self.router_logit_store)
-    def clear_router_logits(self):
-        self.router_logit_store = []
-    def write_to_csv(self):
-        with open(self.csv_path, 'a', newline='') as csvfile:
-            csvwriter = csv.writer(csvfile)
-            
-            # Check if the file is empty to decide whether to write the header
-            csvfile.seek(0)  # Go to the start of the file
-            if csvfile.tell() == 0:  # If file is empty, write the header
-                # Creating a header row
-                # Assuming a maximum number of logits, you can adjust this as needed
-                max_logits = 8  # Example, change this based on your maximum number of logits
-                header = ['Batch Index', 'Layer Index'] + [f'Logit_{i}' for i in range(max_logits)]
-                csvwriter.writerow(header)
-
-            # Writing the logit data
-            for batch_idx, layer_idx, logits_tensor in self.router_logit_store:
-                logits_list = logits_tensor.tolist()  # Convert tensor to a list
-                for logit in logits_list:
-                    row = [batch_idx, layer_idx] + logit  # Combine batch and layer index with logit values
-                    csvwriter.writerow(row)
 
 
 
@@ -403,6 +358,7 @@ class MixtralForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.linear_method = linear_method
+        # print(MixtralLogitStore.__dict__)
         self.logit_store = MixtralLogitStore.get_instance()  # Initialize the logit store
         self.model = MixtralModel(config, linear_method, self.logit_store)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
