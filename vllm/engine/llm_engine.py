@@ -19,7 +19,7 @@ from vllm.sequence import (SamplerOutput, Sequence, SequenceGroup,
 from vllm.transformers_utils.tokenizer import (detokenize_incrementally,
                                                get_tokenizer)
 from vllm.utils import Counter, set_cuda_visible_devices, get_ip, get_open_port, get_distributed_init_method
-
+from vllm.model_executor.mixtral_logit_store import MixtralLogitStore
 if ray:
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 

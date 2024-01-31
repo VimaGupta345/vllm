@@ -1,0 +1,313 @@
+diff --git a/dataset/openchat_sharegpt4_dataset b/dataset/openchat_sharegpt4_dataset
+deleted file mode 160000
+index ef43fd2..0000000
+--- a/dataset/openchat_sharegpt4_dataset
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit ef43fd2adc007847dba74001094a8d68170b457f
+diff --git a/examples/offline_inference.py b/examples/offline_inference.py
+index 3e5c1fe..9b758fa 100644
+--- a/examples/offline_inference.py
++++ b/examples/offline_inference.py
+@@ -11,7 +11,7 @@ prompts = [
+ sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+
+ # Create an LLM.
+-llm = LLM(model="mistralai/Mixtral-8x7B-Instruct-v0.1", enforce_eager=True, tensor_parallel_size=2)
++llm = LLM(model="facebook/opt-125m")
+ # Generate texts from the prompts. The output is a list of RequestOutput objects
+ # that contain the prompt, generated text, and other information.
+ outputs = llm.generate(prompts, sampling_params)
+diff --git a/post_process.py b/post_process.py
+deleted file mode 100644
+index 9414925..0000000
+--- a/post_process.py
++++ /dev/null
+@@ -1,58 +0,0 @@
+-import pandas as pd
+-
+-# Replace 'your_file.csv' with the path to your CSV file
+-input_file = 'unique_router_logits.csv'
+-# output_file = 'unique_router_logits.csv'
+-
+-# Read the CSV file
+-df = pd.read_csv(input_file)
+-
+-number_of_rows = df.shape[0]
+-print("Number of rows:", number_of_rows)
+-
+-# # Drop duplicate rows
+-# unique_df = df.drop_duplicates()
+-
+-# # Save the unique rows to a new CSV file
+-# unique_df.to_csv(output_file, index=False)
+-
+-# print("Duplicate rows removed and unique rows saved to 'unique_rows.csv'")
+-
+-
+-# import pandas as pd
+-# import csv
+-# # Function to detect the delimiter in a CSV file
+-# def detect_delimiter(csv_file):
+-#     with open(csv_file, 'r', newline='', encoding='utf-8') as file:
+-#         sniffer = csv.Sniffer()
+-#         dialect = sniffer.sniff(file.readline())
+-#         return dialect.delimiter
+-
+-
+-# # Load the CSV file
+-# input_file = 'unique_router_logits.csv'  # Replace with your file path
+-# output_file = 'highlighted_file.csv'  # Output file
+-# delimiter = detect_delimiter(input_file)
+-# df = pd.read_csv(input_file)
+-
+-# # Function to highlight top 2 values in Logit_x columns
+-# def highlight_top2(row):
+-#     logit_cols = [col for col in df.columns if col.startswith('Logit_')]
+-#     top2 = row[logit_cols].nlargest(2).index  # Get the indices of the top 2 values
+-#     new_row = row.copy()
+-#     for col in logit_cols:
+-#         if col in top2:
+-#             new_row[col] = f'**{row[col]}**'
+-#     return new_row
+-
+-# # Apply the function to each row
+-# highlighted_df = df.apply(highlight_top2, axis=1)
+-
+-# # Save the modified dataframe using the same delimiter
+-# highlighted_df.to_csv(output_file, index=False, sep=delimiter)
+-
+-# print(f"File saved with top 2 values highlighted in '{output_file}'")
+-
+-
+-
+-
+diff --git a/setup.py b/setup.py
+index 5968724..fb37a8d 100644
+--- a/setup.py
++++ b/setup.py
+@@ -25,12 +25,12 @@ def _is_hip() -> bool:
+
+
+ def _is_neuron() -> bool:
+-    torch_neuronx_installed = False
+-    # try:
+-    #     subprocess.run(["neuron-ls"], capture_output=True, check=True)
+-    # except FileNotFoundError as e:
+-    #     torch_neuronx_installed = False
+-    # return torch_neuronx_installed
++    torch_neuronx_installed = True
++    try:
++        subprocess.run(["neuron-ls"], capture_output=True, check=True)
++    except FileNotFoundError as e:
++        torch_neuronx_installed = False
++    return torch_neuronx_installed
+
+
+ def _is_cuda() -> bool:
+diff --git a/vllm/engine/llm_engine.py b/vllm/engine/llm_engine.py
+index 594d5a2..85f5208 100644
+--- a/vllm/engine/llm_engine.py
++++ b/vllm/engine/llm_engine.py
+@@ -19,7 +19,7 @@ from vllm.sequence import (SamplerOutput, Sequence, SequenceGroup,
+ from vllm.transformers_utils.tokenizer import (detokenize_incrementally,
+                                                get_tokenizer)
+ from vllm.utils import Counter, set_cuda_visible_devices, get_ip, get_open_port, get_distributed_init_method
+-from vllm.model_executor.mixtral_logit_store import MixtralLogitStore
++
+ if ray:
+     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+diff --git a/vllm/model_executor/mixtral_logit_store.py b/vllm/model_executor/mixtral_logit_store.py
+deleted file mode 100644
+index a349e0d..0000000
+--- a/vllm/model_executor/mixtral_logit_store.py
++++ /dev/null
+@@ -1,74 +0,0 @@
+-"""Defining the MixtralLogitStore class to store the router logits computed in forward pass of MixtralMoE for each token in the sequence."""
+-from typing import List, Optional, Tuple
+-
+-import numpy as np
+-import os
+-
+-import torch
+-import csv
+-import torch.nn.functional as F
+-
+-from torch import logit, nn
+-from transformers import MixtralConfig
+-
+-
+-
+-class MixtralLogitStore(nn.Module):
+-    _instance = None
+-    """This code dumps the router logits computed in forward pass of MixtralMoE for each token in the sequence."""
+-    def __init__(self):
+-        super().__init__()
+-        self.router_logit_store = []
+-        self.batch_idx = 0
+-        self.profile_complete = False
+-
+-    @classmethod
+-    def get_instance(cls):
+-        if cls._instance is None:
+-            cls._instance = MixtralLogitStore()
+-        return cls._instance
+-
+-    def mark_profiling_done(self):
+-        self.profile_complete = True
+-
+-    def dump_router_logits(self, router_logits, layer_idx):
+-        if router_logits.is_cuda:
+-            router_logits = router_logits.cpu()
+-        self.router_logit_store.append((self.batch_idx, layer_idx, router_logits))
+-
+-    def end_batch(self):
+-        self.batch_idx += 1
+-        # if self.batch_idx%5 == 0:
+-        self.write_to_csv(batch_idx = self.batch_idx)
+-        self.clear_router_logits()
+-
+-    def get_stored_router_logits(self):
+-        # router_logits: (batch * sequence_length, n_experts)
+-        # returned value: number of tokens, batch_size*seq_len, n_experts
+-        return torch.stack(self.router_logit_store)
+-
+-    def clear_router_logits(self):
+-        self.router_logit_store = []
+-
+-    def write_to_csv(self, batch_idx):
+-        if not os.path.exists('router'):
+-            os.mkdir('router_logits')
+-        csv_path = f"router/router_logits_{batch_idx}.csv"
+-        with open(csv_path, 'a', newline='') as csvfile:
+-            csvwriter = csv.writer(csvfile)
+-
+-            # Check if the file is empty to decide whether to write the header
+-            csvfile.seek(0)  # Go to the start of the file
+-            if csvfile.tell() == 0:  # If file is empty, write the header
+-                # Creating a header row
+-                # Assuming a maximum number of logits, you can adjust this as needed
+-                max_logits = 8  # Example, change this based on your maximum number of logits
+-                header = ['Batch Index', 'Layer Index'] + [f'Logit_{i}' for i in range(max_logits)]
+-                csvwriter.writerow(header)
+-
+-            # Writing the logit data
+-            for batch_idx, layer_idx, logits_tensor in self.router_logit_store:
+-                logits_list = logits_tensor.tolist()  # Convert tensor to a list
+-                for logit in logits_list:
+-                    row = [batch_idx, layer_idx] + logit  # Combine batch and layer index with logit values
+-                    csvwriter.writerow(row)
+diff --git a/vllm/model_executor/models/mixtral.py b/vllm/model_executor/models/mixtral.py
+index 5bcb2c3..094dbe0 100644
+--- a/vllm/model_executor/models/mixtral.py
++++ b/vllm/model_executor/models/mixtral.py
+@@ -32,8 +32,6 @@ import torch.nn.functional as F
+ from torch import logit, nn
+ from transformers import MixtralConfig
+
+-from vllm.model_executor.mixtral_logit_store import MixtralLogitStore
+-
+ from vllm.model_executor.input_metadata import InputMetadata
+ from vllm.model_executor.layers.attention import PagedAttention
+ from vllm.model_executor.layers.layernorm import RMSNorm
+@@ -55,6 +53,7 @@ from vllm.model_executor.weight_utils import (default_weight_loader,
+ from vllm.sequence import SamplerOutput
+
+ KVCache = Tuple[torch.Tensor, torch.Tensor]
++LogitStore = List[torch.Tensor]
+
+ class MixtralMLP(nn.Module):
+
+@@ -94,6 +93,52 @@ class MixtralMLP(nn.Module):
+         current_hidden_states, _ = self.w2(current_hidden_states)
+         return current_hidden_states
+
++class MixtralLogitStore(nn.Module):
++    """This code dumps the router logits computed in forward pass of MixtralMoE for each token in the sequence."""
++    def __init__(self):
++        super().__init__()
++        self.router_logit_store = []
++        self.csv_path = "router_logits.csv"
++        self.dump_frequency = 1000
++        self.batch_idx = 0
++    def dump_router_logits(self, router_logits, layer_idx):
++        if router_logits.is_cuda:
++            router_logits = router_logits.cpu()
++        self.router_logit_store.append((self.batch_idx, layer_idx, router_logits))
++
++    def end_batch(self):
++        self.batch_idx += 1
++        if self.batch_idx%5 == 0:
++            self.write_to_csv()
++            self.clear_router_logits()
++
++    def get_stored_router_logits(self):
++        # router_logits: (batch * sequence_length, n_experts)
++        # returned value: number of tokens, batch_size*seq_len, n_experts
++        return torch.stack(self.router_logit_store)
++    def clear_router_logits(self):
++        self.router_logit_store = []
++    def write_to_csv(self):
++        with open(self.csv_path, 'a', newline='') as csvfile:
++            csvwriter = csv.writer(csvfile)
++
++            # Check if the file is empty to decide whether to write the header
++            csvfile.seek(0)  # Go to the start of the file
++            if csvfile.tell() == 0:  # If file is empty, write the header
++                # Creating a header row
++                # Assuming a maximum number of logits, you can adjust this as needed
++                max_logits = 8  # Example, change this based on your maximum number of logits
++                header = ['Batch Index', 'Layer Index'] + [f'Logit_{i}' for i in range(max_logits)]
++                csvwriter.writerow(header)
++
++            # Writing the logit data
++            for batch_idx, layer_idx, logits_tensor in self.router_logit_store:
++                logits_list = logits_tensor.tolist()  # Convert tensor to a list
++                for logit in logits_list:
++                    row = [batch_idx, layer_idx] + logit  # Combine batch and layer index with logit values
++                    csvwriter.writerow(row)
++
++
+
+ class MixtralMoE(nn.Module):
+
+@@ -142,7 +187,7 @@ class MixtralMoE(nn.Module):
+         # router_logits: (batch * sequence_length, n_experts)
+         router_logits, _ = self.gate(hidden_states)
+         # store the router logits for each token when the batch starts?
+-        if self.logits_store.profile_complete:
++        if self.logits_store is not None:
+             self.logits_store.dump_router_logits(router_logits, layer_idx = self.layer_idx)
+
+         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+@@ -357,7 +402,7 @@ class MixtralForCausalLM(nn.Module):
+         super().__init__()
+         self.config = config
+         self.linear_method = linear_method
+-        self.logit_store = MixtralLogitStore.get_instance()  # Initialize the logit store
++        self.logit_store = MixtralLogitStore()  # Initialize the logit store
+         self.model = MixtralModel(config, linear_method, self.logit_store)
+         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+         self.sampler = Sampler(config.vocab_size)
+diff --git a/vllm/worker/worker.py b/vllm/worker/worker.py
+index 5f786b7..7d99c63 100644
+--- a/vllm/worker/worker.py
++++ b/vllm/worker/worker.py
+@@ -15,7 +15,7 @@ from vllm.model_executor.parallel_utils.parallel_state import (
+ from vllm.sequence import SamplerOutput, SequenceGroupMetadata
+ from vllm.worker.cache_engine import CacheEngine
+ from vllm.worker.model_runner import ModelRunner
+-from vllm.model_executor.mixtral_logit_store import MixtralLogitStore
++
+
+ class Worker:
+     """A worker class that executes (a partition of) the model on a GPU.
+@@ -134,7 +134,6 @@ class Worker:
+         # Reset the seed to ensure that the random state is not affected by
+         # the model initialization and profiling.
+         set_random_seed(self.model_config.seed)
+-        MixtralLogitStore.get_instance().mark_profiling_done()
+
+     def cache_swap(
+         self,

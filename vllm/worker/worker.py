@@ -15,7 +15,7 @@ from vllm.model_executor.parallel_utils.parallel_state import (
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.model_runner import ModelRunner
-
+from vllm.model_executor.mixtral_logit_store import MixtralLogitStore
 
 class Worker:
     """A worker class that executes (a partition of) the model on a GPU.
@@ -134,6 +134,7 @@ class Worker:
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        MixtralLogitStore.get_instance().mark_profiling_done()
 
     def cache_swap(
         self,

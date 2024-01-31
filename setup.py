@@ -25,13 +25,7 @@ def _is_hip() -> bool:
 
 
 def _is_neuron() -> bool:
-    torch_neuronx_installed = True
-    try:
-        subprocess.run(["neuron-ls"], capture_output=True, check=True)
-    except FileNotFoundError as e:
-        torch_neuronx_installed = False
-    return torch_neuronx_installed
-
+    torch_neuronx_installed = False
 
 def _is_cuda() -> bool:
     return (torch.version.cuda is not None) and not _is_neuron()

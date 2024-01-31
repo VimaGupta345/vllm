@@ -51,6 +51,7 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.weight_utils import (default_weight_loader,
                                               hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
+from vllm.model_executor.mixtral_logit_store import MixtralLogitStore
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 LogitStore = List[torch.Tensor]
@@ -187,7 +188,7 @@ class MixtralMoE(nn.Module):
         # router_logits: (batch * sequence_length, n_experts)
         router_logits, _ = self.gate(hidden_states)
         # store the router logits for each token when the batch starts?
-        if self.logits_store is not None:
+        if self.logits_store.profile_complete:
             self.logits_store.dump_router_logits(router_logits, layer_idx = self.layer_idx)
         
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
@@ -402,7 +403,7 @@ class MixtralForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.logit_store = MixtralLogitStore()  # Initialize the logit store
+        self.logit_store = MixtralLogitStore.get_instance()  # Initialize the logit store
         self.model = MixtralModel(config, linear_method, self.logit_store)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.sampler = Sampler(config.vocab_size)
